@@ -1,0 +1,189 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.layers import Dropout
+from scipy import stats
+
+# =====================
+# 1. Synthetic Data Generator
+# =====================
+class PPGSyntheticDataGenerator:
+    def __init__(self, n_subjects=400, af_ratio=0.5):
+        self.n_subjects = n_subjects
+        self.af_ratio = af_ratio  # AF prevalence ratio
+    
+    def _generate_hrv_features(self):
+        """Generate 10D PPG feature vectors (time/frequency/nonlinear domains)"""
+        # Temporal features
+        rmssd = np.random.lognormal(mean=1.2, sigma=0.3, size=self.n_subjects)  # Increased in AF
+        sdsd = rmssd * np.random.uniform(0.8, 1.2)
+        pnn70 = np.random.beta(a=1, b=5, size=self.n_subjects)  # >0.12 in AF
+        sdnn = np.random.lognormal(mean=2.0, sigma=0.4)
+        
+        # Spectral features 
+        lf_power = np.random.gamma(shape=2, scale=0.5)
+        hf_power = np.random.gamma(shape=1.5, scale=0.3)
+        lf_hf_ratio = lf_power / (hf_power + 1e-6)
+        
+        # Nonlinear features 
+        shannon_ent = np.random.normal(loc=3.0, scale=0.5)
+        sample_ent = np.random.normal(loc=1.5, scale=0.3)
+        sd1 = np.random.lognormal(mean=-0.5, sigma=0.2)  # Poincaré SD1
+        sd2 = sd1 * np.random.uniform(1.5, 2.5)          # Poincaré SD2
+        
+        return np.vstack([rmssd, sdsd, pnn70, sdnn, lf_power, 
+                         hf_power, lf_hf_ratio, shannon_ent, sample_ent, sd1/sd2]).T
+    
+    def generate_dataset(self):
+        """Generate synthetic PPG dataset with AF/non-AF labels"""
+        # Generate features and labels
+        X = self._generate_hrv_features()
+        y = np.zeros(self.n_subjects)
+        af_indices = np.random.choice(self.n_subjects, int(self.n_subjects * self.af_ratio), replace=False)
+        y[af_indices] = 1
+        
+        # Apply pathological perturbations to AF samples
+        X[af_indices, 0] *= 1.5  # ↑ RMSSD in AF
+        X[af_indices, 2] += 0.2  # ↑ pNN70 in AF
+        X[af_indices, 6] *= 0.7  # ↓ LF/HF in AF
+        
+        # Z-score normalization
+        X = stats.zscore(X, axis=0)
+        return X, y
+
+# =====================
+# 2. Daily AF Snapshot Model
+# =====================
+class MCDropoutMLP(tf.keras.Model):
+    def __init__(self, dropout_rate=0.3):
+        """MLP with Monte Carlo Dropout for probabilistic classification"""
+        super().__init__()
+        self.dense1 = layers.Dense(64, activation='relu')  # Single hidden layer
+        self.dropout = Dropout(dropout_rate)  # MC Dropout layer
+        self.dense2 = layers.Dense(2, activation='softmax')  # Binary output
+    
+    def call(self, inputs, training=False):
+        """Forward pass with MC Dropout (Eq.1-2)"""
+        x = self.dense1(inputs)
+        x = self.dropout(x, training=training)  # Active in both train/inference
+        return self.dense2(x)
+    
+    def mc_predict(self, x, n_samples=100):
+        """MC Dropout prediction (Eq.2)"""
+        # Stochastic forward passes (K=100)
+        samples = [self.call(x, training=True) for _ in range(n_samples)]
+        return tf.reduce_mean(samples, axis=0)  # Mean probability
+
+# =====================
+# 3. Bayesian Burden Fusion
+# =====================
+class BayesianBurdenFusion:
+    def __init__(self):
+        self.prior = 0.5  # Initial prior probability
+    
+    def update(self, daily_prob):
+        """Bayesian probability update (Eq.3)"""
+        likelihood = daily_prob
+        denominator = likelihood * self.prior + (1 - likelihood) * (1 - self.prior)
+        posterior = (likelihood * self.prior) / denominator
+        self.prior = posterior  # Update prior
+        return posterior
+    
+    def weekly_burden(self, daily_probs):
+        """Compute weekly AF burden (Eq.4)"""
+        burden = 0
+        valid_days = 0
+        self.prior = 0.5  # Reset prior for new week
+        
+        for p in daily_probs:
+            if 0.4 <= p <= 0.6:  # Exclude ambiguous samples
+                continue
+            posterior = self.update(p)
+            burden += posterior
+            valid_days += 1
+        
+        return burden / valid_days if valid_days > 0 else 0
+
+# =====================
+# 4. TCN Trajectory Model
+# =====================
+def TCNBlock(dilation_rate, filters=64, kernel_size=3):
+    """TCN residual block """
+    def apply_block(x):
+        # Causal convolution (Fig 1c)
+        conv_out = layers.Conv1D(
+            filters, kernel_size, padding='causal', 
+            dilation_rate=dilation_rate, activation='relu'
+        )(x)
+        conv_out = layers.Conv1D(
+            filters, 1, padding='same'  # 1x1 conv for dimensionality matching
+        )(conv_out)
+        
+        # Residual connection
+        res = layers.Conv1D(filters, 1, padding='same')(x) if x.shape[-1] != filters else x
+        return layers.Add()([res, conv_out])
+    return apply_block
+
+def build_tcn_model(input_shape=(12, 1)):
+    """Build TCN model for trajectory prediction (Fig 1c)"""
+    inputs = layers.Input(shape=input_shape)
+    x = inputs
+    
+    # 4 residual blocks with increasing dilation
+    for dilation in [1, 2, 4, 12]:  # Dilation sequence
+        x = TCNBlock(dilation)(x)
+    
+    x = layers.GlobalAvgPool1D()(x)
+    outputs = layers.Dense(1, activation='sigmoid')(x)  # Deterioration probability
+    return models.Model(inputs, outputs)
+
+# =====================
+# 5. End-to-End Pipeline
+# =====================
+if __name__ == "__main__":
+    # === Data Generation ===
+    data_gen = PPGSyntheticDataGenerator(n_subjects=400, af_ratio=0.5)
+    X, y = data_gen.generate_dataset()  # Simulate 400 subjects (50% AF)
+    
+    # === Daily Snapshot Training ===
+    snapshot_model = MCDropoutMLP(dropout_rate=0.3)
+    snapshot_model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    # Train for 150 epochs
+    snapshot_model.fit(X, y, epochs=150, batch_size=16, validation_split=0.2)
+    
+    # === Weekly Burden Calculation ===
+    fusion = BayesianBurdenFusion()
+    trajectories = []  # Store 12-week trajectories
+    
+    # Generate trajectories for 40 patients
+    for _ in range(40):
+        weekly_burdens = []
+        for week in range(12):
+            daily_probs = []
+            # Simulate daily monitoring (7 days/week)
+            for day in range(7):
+                idx = np.random.randint(0, len(X))
+                prob_af = snapshot_model.mc_predict(X[idx:idx+1])[0][1].numpy()
+                daily_probs.append(prob_af)
+            weekly_burdens.append(fusion.weekly_burden(daily_probs))
+        trajectories.append(weekly_burdens)
+    
+    trajectories = np.array(trajectories)[..., np.newaxis]  # Add channel dim
+    
+    # === TCN Trajectory Training ===
+    # Simulate labels (29 deterioration, 11 stable)
+    tcn_labels = np.zeros(40)
+    tcn_labels[:29] = 1  # Section 3.1 cohort distribution
+    
+    tcn_model = build_tcn_model()
+    tcn_model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        loss='binary_crossentropy',
+        metrics=['AUC']  # Primary evaluation metric
+    )
+    # Train for 100 epochs
+    tcn_model.fit(trajectories, tcn_labels, epochs=100, batch_size=8, validation_split=0.2)
